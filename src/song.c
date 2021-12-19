@@ -113,105 +113,83 @@ int compile_song(struct song *s) {
 	return (tout - spc) - s->address;
 }
 
+#define MAX_PATTERNS 128
+static WORD pattern_ptrs[MAX_PATTERNS];
+static int pattern_ptrs_used;
+static int lookup_pattern_ptr(WORD pattern_ptr) {
+	for (int i = 0; i < pattern_ptrs_used; i += 1) {
+		if (pattern_ptrs[i] == pattern_ptr) {
+			return i;
+		}
+	}
+	return -1;
+}
+static void add_pattern_ptr(WORD pattern_ptr) {
+	if (lookup_pattern_ptr(pattern_ptr) < 0) {
+		pattern_ptrs[pattern_ptrs_used] = pattern_ptr;
+		pattern_ptrs_used += 1;
+	}
+}
+
+#define MAX_TRACKS (MAX_PATTERNS * 8)
+static WORD track_ptrs[MAX_TRACKS];
+
 void decompile_song(struct song *s, int start_addr, int end_addr) {
+	pattern_ptrs_used = 0;
+
 	char *error = errbuf;
 	s->address = start_addr;
 	s->changed = FALSE;
 
-	// Get order length and repeat info (at this point, we don't know how
-	// many patterns there are, so the pattern pointers aren't validated yet)
+	// Get order length and number of patterns
 	WORD *wp = (WORD *)&spc[start_addr];
-	while (*wp >= 0x100) wp++;
+	while (*wp >= 0x100) { add_pattern_ptr(*wp++); }
 	s->order_length = wp - (WORD *)&spc[start_addr];
 	if (s->order_length == 0) {
 		error = "Order length is 0";
 		goto error1;
 	}
+	// Get repeat info
 	s->repeat = *wp++;
 	if (s->repeat == 0) {
 		s->repeat_pos = 0;
+	} else if (s->repeat < 0x82) {
+		sprintf(errbuf, "Unsupported conditional repeat value of %d", s->repeat);
+		goto error1;
 	} else {
 		int repeat_off = *wp++ - start_addr;
 		if (repeat_off & 1 || repeat_off < 0 || repeat_off >= s->order_length*2) {
 			sprintf(errbuf, "Bad repeat pointer: %x", repeat_off + start_addr);
 			goto error1;
 		}
-		if (*wp++ != 0) {
-			error = "Repeat not followed by end of song";
-			goto error1;
-		}
 		s->repeat_pos = repeat_off >> 1;
-	}
-
-	int first_pattern = (BYTE *)wp - spc;
-
-	int tracks_start;
-	// locate first track, determine number of patterns
-	while (((BYTE *)wp)+1 < &spc[end_addr] && *wp == 0) wp++;
-	if (((BYTE *)wp)+1 >= &spc[end_addr]) {
-		// no tracks in the song
-		tracks_start = end_addr - 1;
-	} else {
-		tracks_start = *wp;
-	}
-
-	int pat_bytes = tracks_start - first_pattern;
-	if (pat_bytes <= 0 || pat_bytes & 15) {
-		sprintf(errbuf, "Bad first track pointer: %x", tracks_start);
-		goto error1;
-	}
-
-	int tracks_end;
-	if (((BYTE *)wp)+1 >= &spc[end_addr]) {
-		// no tracks in the song
-		tracks_end = end_addr - 1;
-	} else {
-		// find the last track
-		int tp, tpp = tracks_start;
-		while ((tp = *(WORD *)&spc[tpp -= 2]) == 0);
-
-		if (tp < tracks_start || tp >= end_addr) {
-			sprintf(errbuf, "Bad last track pointer: %x", tp);
-			goto error1;
-		}
-
-
-		// is the last track the first one in its pattern?
-		BOOL first = TRUE;
-		int chan = (tpp - first_pattern) >> 1 & 7;
-		for (; chan; chan--)
-			first &= *(WORD *)&spc[tpp -= 2] == 0;
-
-		BYTE *end = &spc[tp];
-		while (*end) end = next_code(end);
-		end += first;
-		tracks_end = end - spc;
 	}
 
 	// Now the number of patterns is known, so go back and get the order
 	s->order = malloc(sizeof(int) * s->order_length);
 	wp = (WORD *)&spc[start_addr];
 	for (int i = 0; i < s->order_length; i++) {
-		int pat = *wp++ - first_pattern;
-		if (pat < 0 || pat >= pat_bytes || pat & 15) {
-			sprintf(errbuf, "Bad pattern pointer: %x", pat + first_pattern);
-			goto error2;
-		}
-		s->order[i] = pat >> 4;
+		s->order[i] = lookup_pattern_ptr(*wp++);
 	}
 
 	WORD *sub_table = NULL;
-	s->patterns = pat_bytes >> 4;
+	s->patterns = pattern_ptrs_used;
 	s->pattern = calloc(sizeof(*s->pattern), s->patterns);
 	s->subs = 0;
 	s->sub = NULL;
 
-	wp = (WORD *)&spc[first_pattern];
+	// Get track pointers laid out sequentially
+	for (int pattern = 0; pattern < s->patterns; pattern += 1) {
+		wp = (WORD *)(&spc[pattern_ptrs[pattern]]);
+		memcpy(track_ptrs + pattern * 8, wp, sizeof(WORD) * 8);
+	}
+
+	wp = track_ptrs;
 	for (int trk = 0; trk < s->patterns * 8; trk++) {
 		struct track *t = &s->pattern[0][0] + trk;
 		int start = *wp++;
 		if (start == 0) continue;
-		if (start < tracks_start || start >= tracks_end) {
+		if (start < start_addr || start >= end_addr) {
 			sprintf(errbuf, "Bad track pointer: %x", start);
 			goto error3;
 		}
@@ -222,7 +200,7 @@ void decompile_song(struct song *s, int start_addr, int end_addr) {
 		// end of memory to find a 00 byte to terminate the track.
 		int next = 0x10000; // offset of following track
 		for (int track_ind = 0; track_ind < (s->patterns * 8); track_ind += 1) {
-			int track_addr = ((WORD *)(spc + first_pattern))[track_ind];
+			int track_addr = track_ptrs[track_ind];
 			if (track_addr < next && track_addr > start) {
 				next = track_addr;
 			}
